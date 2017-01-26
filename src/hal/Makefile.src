@@ -1,0 +1,151 @@
+# Makefile for the link-time HAL in <xtensa_tools_root>/xtensa-elf/src/hal
+
+# Copyright (c) 1999-2013 Tensilica Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+#
+#  This makefile assumes GNU make features
+#
+#  Invoke this Makefile like this:
+#	cd <some build directory>
+#	make -f <this file> XTENSA_TOOLS_ROOT=<path to Xtensa Tools> \
+#		XTENSA_ROOT=<path to Xtensa core package> \
+#		INSTLIBDIR=<path to installation directory>
+#
+
+ifndef XTENSA_TOOLS_ROOT
+$(error Please set XTENSA_TOOLS_ROOT to the path to Xtensa Tools)
+endif
+#  NOTE:  For now, we assume $(XTENSA_TOOLS_ROOT)/bin is on the PATH.
+ifndef XTENSA_ROOT
+$(error Please set XTENSA_ROOT to the path to your specific Xtensa core package)
+endif
+ifndef INSTLIBDIR
+$(error Please set INSTLIBDIR to the path where libraries and objects are installed)
+#INSTLIBDIR = $(call fixpath,$(XTENSA_ROOT)/xtensa-elf/arch/lib)
+endif
+
+#  Select the specified Xtensa configuration:
+export XTENSA_SYSTEM = $(XTENSA_ROOT)/config
+export XTENSA_CORE = default
+
+include $(XTENSA_TOOLS_ROOT)/misc/defs.mk
+
+ifndef SRCDIR
+$(error Please set MAKEFILE_SRC to the path to this Makefile.src)
+endif
+
+CFLAGS = -O2 -g -mlongcalls
+
+#  Uncomment this to compile deprecated (pre-T1020.2) beta HAL definitions:
+#CFLAGS += -DINCLUDE_DEPRECATED_HAL_CODE
+#  Uncomment this to compile deprecated (pre-T1040.2) debug-support definitions:
+#CFLAGS += -DINCLUDE_DEPRECATED_HAL_DEBUG_CODE
+#  Uncomment this to compile deprecated (pre-T1040.2) cache-support definitions:
+#CFLAGS += -DINCLUDE_DEPRECATED_HAL_CACHE_CODE
+
+
+#  Compile parts of these files separately, to avoid unnecessarily large
+#  objects without creating too many source files.
+#  Files are split with "#[el]if defined(__SPLIT__<tag>)" lines
+#  using normal C preprocessor syntax, where each <tag> must be unique and
+#  consist of lowercase alphanumeric and underscore characters only (no dash etc).
+
+SPLIT_SOURCES = interrupts.c int_asm.S cache_asm.S state_asm.S state.c mem_ecc_parity.S \
+		miscellaneous.S disass.c
+
+#  Determine split object files to create, of form <srcbasename>--<tag>.o :
+SPLIT_OBJS := $(shell cd $(SRCDIR) && $(PERL) -ne '/__SPLIT__(\w+)/ and $$h{$$ARGV."--".$$1}++;\
+ END {foreach (sort keys %h) {s/\..--/--/; print "$$_.o\n";}}' $(SPLIT_SOURCES))
+#  Make doesn't stop if $(shell ...) fails, so catch any such failure explicitly:
+ifeq ($(SPLIT_OBJS),)
+$(error Error invoking $(PERL) to split sources $(SPLIT_SOURCES))
+endif
+
+#  Call0 ABI means the xthal... and xthal..._nw functions are
+#  identical.  If we're building for Call0 ABI, omit the ..._nw
+#  functions (except for xthal_get_intpending_nw, an interrupt handler
+#  helper function for which there is no duplicate and which does not
+#  obey _any_ calling conventions).
+
+CALL0_ABI :=$(filter __XTENSA_CALL0_ABI__, $(shell echo '' | $(CC_FOR_TARGET) --xtensa-system=$(XTENSA_SYSTEM) --xtensa-core=$(XTENSA_CORE) -E -dM - ))
+ifneq ($(CALL0_ABI),)
+SPLIT_OBJS := $(filter-out %_nw.o,$(SPLIT_OBJS))
+SPLIT_OBJS := $(SPLIT_OBJS) int_asm--get_intpending_nw.o
+endif
+
+
+OBJS = \
+	cache.o			\
+	syscache_asm.o		\
+	attribute.o		\
+	coherence.o		\
+	clock.o			\
+	debug.o			\
+	disass.o                \
+	debug_hndlr.o		\
+	memcopy.o		\
+	misc.o			\
+	miscellaneous.o		\
+	mmu.o			\
+	mp_asm.o		\
+	windowspill_asm.o	\
+	set_region_translate.o	\
+	$(SPLIT_OBJS)
+
+HALLIB = libhal.a
+
+
+.PHONY: all install clean
+
+all: $(HALLIB)
+
+$(HALLIB): $(OBJS)
+
+#  For following rule, determine various things from $* (extended basename):
+SPLIT_SOURCE = $(filter $(patsubst %/,%,$(dir $(subst --,/,$*))).%,$(SPLIT_SOURCES))
+SPLIT_TAG    = $(notdir $(subst --,/,$*))
+SPLIT_FLAGS  = $(FLAGS_$(basename $(SPLIT_SOURCE)))
+
+$(SPLIT_OBJS): %.o:
+	$(CC_FOR_TARGET) -c $(CFLAGS) $(SPLIT_FLAGS) $(SRCDIR)/$(SPLIT_SOURCE) -D__SPLIT__$(SPLIT_TAG) -MMD -MF $*.d -o $@
+
+%.o: %.S
+	$(CC_FOR_TARGET) -c $(CFLAGS) $(FLAGS_$*) $< -o $@
+
+%.o: %.c
+	$(CC_FOR_TARGET) -c $(CFLAGS) $(FLAGS_$*) $< -o $@
+
+%.a:
+	-$(RM) $@
+	$(AR_FOR_TARGET) -rs $@ $^
+
+
+install: all
+	$(MKPATH) $(INSTLIBDIR)
+	$(CP) $(HALLIB) $(INSTLIBDIR)
+
+clean:
+	-$(RM) $(OBJS) $(HALLIB) *.d
+
+# NOTE: Header file dependencies not specified!
+-include *.d
+
